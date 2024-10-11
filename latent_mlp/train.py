@@ -8,15 +8,15 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 
 def chi2_neg_log_prob(x:torch.Tensor):
-    x = x.view(x.shape[0], -1) # (N, C, H, W) -> (N, C*H*W)
+    x = x.reshape(x.shape[0], -1) # (N, C, H, W) -> (N, C*H*W)
     d = x.shape[1]
-    norm = torch.norm(x, dim=1, p=2) ** 2 # (N, )
-    reg = (d/2 - 1) * torch.log(norm) - norm / 2 # (N, )
+    norm = torch.norm(x, dim=1, p=2) # (N, )
+    reg = (d-2) * torch.log(norm) - (norm **2) / 2 # (N, )
     const = -d/2 * torch.log(torch.tensor(2)) - torch.lgamma(torch.tensor(d/2)) # scalar
-    const = const.to(x.device)
+    const = const.to(x.device).detach()
     reg = const + reg
-    print(f"norm.shape : {norm.shape}, neg-reg.shape: {reg.shape}")
-    print(f"norm : {norm.mean()}, neg-reg: {- reg.mean()}")
+    # print(f"norm.shape : {norm.shape}, neg-reg.shape: {reg.shape}")
+    # print(f"norm : {norm.mean()}, neg-reg: {- reg.mean()}")
     return  -(reg.mean())
 
 def train_unet(model, train_dataloader, val_dataloader, save_dir, writer, device, args):
