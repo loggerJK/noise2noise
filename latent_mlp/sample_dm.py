@@ -21,7 +21,7 @@ def main(args):
     # Scheduler
     noise_scheduler = DDIMScheduler(num_train_timesteps=1000)
     pipe = DDIMPipeline.from_pretrained(args.model_path)
-    pipe = pipe.to('cuda')
+    # pipe = pipe.to('cuda')
 
 
     for i in range(args.target_size):

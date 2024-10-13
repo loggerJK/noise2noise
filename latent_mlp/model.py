@@ -66,7 +66,7 @@ class TrainingConfig():
     learning_rate = 1e-4
     lr_warmup_steps = 500
     save_image_epochs = 1
-    save_model_epochs = 1
+    save_model_epochs = 2
     mixed_precision = "fp16"  # `no` for float32, `fp16` for automatic mixed precision
     output_dir = "results/DDPM"  # the model name locally and on the HF Hub
 
@@ -85,6 +85,8 @@ def create_unet_dm(args):
     setattr(config, "output_dir", args.save_dir)
     setattr(config, "train_batch_size", args.batch_size)
     setattr(config, "eval_batch_size", args.batch_size)
+    setattr(config, "save_model_epochs", args.save_every_epochs)
+    setattr(config, "save_image_epochs", args.save_every_epochs)
 
     from diffusers import UNet2DModel
 

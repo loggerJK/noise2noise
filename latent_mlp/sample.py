@@ -16,12 +16,13 @@ def main(args):
 
     # Load Model
     model = UNet(4,4)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cpu'
     model.to(device)
     model.eval()
 
     model_path = args.model_path
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path, map_location=device))
 
 
     for i in range(args.target_size):

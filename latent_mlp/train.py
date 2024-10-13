@@ -6,6 +6,7 @@ from model import residualMLP, UNet
 import os
 from tqdm import tqdm
 from argparse import ArgumentParser
+from utils import my_collate_fn, CustomDataset
 
 def chi2_neg_log_prob(x:torch.Tensor):
     x = x.reshape(x.shape[0], -1) # (N, C, H, W) -> (N, C*H*W)
@@ -24,7 +25,7 @@ def train_unet(model, train_dataloader, val_dataloader, save_dir, writer, device
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     model.train()
-    for epoch in tqdm(range(20)):
+    for epoch in tqdm(range(args.num_epochs)):
         for i, (x, y) in enumerate(train_dataloader):
             step = i + epoch * len(train_dataloader)
             optimizer.zero_grad()
@@ -47,25 +48,25 @@ def train_unet(model, train_dataloader, val_dataloader, save_dir, writer, device
             optimizer.step()
             print(f"epoch: {epoch}, step: {step}, loss: {loss.item()}")
 
-            # Validation loop
-            if (step ) % args.validation_every == 0:
-                model.eval()
-                val_loss = 0.0
-                with torch.no_grad():
-                    for val_x, val_y in tqdm(val_dataloader):
-                        val_x = val_x.to(device)
-                        val_y = val_y.to(device)
-                        val_y_pred = model(val_x)
-                        val_loss += criterion(val_y_pred, val_y).item()
+        # Validation loop
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for val_x, val_y in tqdm(val_dataloader):
+                val_x = val_x.to(device)
+                val_y = val_y.to(device)
+                val_y_pred = model(val_x)
+                val_loss += criterion(val_y_pred, val_y).item()
 
-                val_loss /= len(val_dataloader)
-                writer.add_scalar('Loss/val', val_loss, step)
-                print(f"epoch: {epoch}, val_loss: {val_loss}")
-                model.train()
+        val_loss /= len(val_dataloader)
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        print(f"epoch: {epoch}, val_loss: {val_loss}")
+        model.train()
 
 
         # Save Model
-        torch.save(model.state_dict(), os.path.join(save_dir, f"model_{epoch}epoch.pt"))
+        if (epoch ) % args.save_every_epochs == 0:
+            torch.save(model.state_dict(), os.path.join(save_dir, f"model_{epoch}epoch.pt"))
 
 def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, device, args):
     from accelerate import Accelerator
@@ -87,13 +88,22 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
 
     import torch.nn.functional as F
 
-    model, config = create_unet_dm(args) # Now, config contains args
+    if args.pretrained is not None:
+        # Initialize
+        model, config = create_unet_dm(args) # Now, config contains args
 
-    print(f"Model config: {config}")
+        print(f"Model config: {config}")
 
-    noise_scheduler = DDIMScheduler(num_train_timesteps=1000,
-                                    clip_sample=False,
-                                    )
+        noise_scheduler = DDIMScheduler(num_train_timesteps=1000,
+                                        clip_sample=False,
+                                        )
+    else :
+        # Restore from pretrained
+        pipe = DDIMPipeline.from_pretrained(args.pretrained)
+        model = pipe.unet
+        noise_scheduler = pipe.scheduler
+        if args.restore_config : config = pipe.config
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
@@ -181,6 +191,7 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                 print(f"Generating images for epoch {epoch}, length : {len(val_dataloader)}")
                 val_progress_bar = tqdm(total=len(val_dataloader), disable=not accelerator.is_local_main_process)
                 val_progress_bar.set_description(f"Val Epoch {epoch}")
+                val_loss = 0.0
                 for val_x, val_y in (val_dataloader):
                     pred = pipeline(
                         batch_size=config.eval_batch_size,
@@ -193,22 +204,25 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                     if config.chi2_reg > 0:
                         reg = chi2_neg_log_prob(pred)
                         loss += config.chi2_reg * reg
-                    logs = {"Loss/val": loss.detach().item()}
-                    if args.chi2_reg > 0:
-                        logs["Loss/chi2_reg"] = reg.detach().item()
-                    accelerator.log(logs, step=global_step)
+                    val_loss += loss.item()
                     val_progress_bar.update(1)
+                val_loss /= len(val_dataloader)
+                logs = {"Loss/val": val_loss}
+                if args.chi2_reg > 0:
+                    logs["Loss/chi2_reg"] = reg.detach().item()
+                accelerator.log(logs, step=epoch) # Log the validation loss every epoch
 
         if accelerator.is_main_process :
+            pipeline = DDIMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
+            pipeline.save_pretrained(config.output_dir)
             if (epoch % config.save_model_epochs == 0):
-                pipeline = DDIMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
-                pipeline.save_pretrained(config.output_dir)
+                pipeline.save_pretrained(os.path.join(config.output_dir, f"model_{epoch}epoch"))
 
 
 
 
 def main(args):
-    # Config
+    #### Config
     save_dir = './results/' + args.run_name
     args.save_dir = save_dir
     os.makedirs(save_dir, exist_ok=True)
@@ -218,11 +232,15 @@ def main(args):
         writer = None
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"device: {device}")
+    # Save args
+    with open(os.path.join(save_dir, 'args.txt'), 'w') as f:
+        f.write(str(args))
 
-    # Load Dataset
+
+    ##### Load Dataset
     import glob
     from pprint import pprint
-    folder_path = '/media/dataset1/donghoon/noise2noise/corgi-riding-skateboard-fix-prompt-error-while-inversion/sdxl/'
+    folder_path = '/media/data1/noise2noise_dataset/sdxl/'
     # 0_initial_latent.pt
     initial_latents = sorted(glob.glob(folder_path + '*_initial_latent.pt'), key=lambda x: int(x.split('/')[-1].split('_')[0]))
     # 0_latent.pt
@@ -233,11 +251,12 @@ def main(args):
         initial_latents = initial_latents[:100]
         inversion_latents = inversion_latents[:100]
 
+    # File loading
     initial_latents_loaded = []
     inversion_latents_loaded = []
 
     ## inversion latents 중에서, 대응하는 inital latent가 있는지 확인하고, 있는 경우에만 로드한다
-    for i, latent in tqdm(enumerate(inversion_latents)):
+    for i, latent in tqdm(enumerate(inversion_latents), total=len(inversion_latents)):
         initial_latent = latent.replace('_inversion_latent.pt', '_initial_latent.pt')
         if initial_latent in initial_latents:
             initial_latents_loaded.append(torch.load(initial_latent).cpu().numpy())
@@ -253,7 +272,7 @@ def main(args):
     print(f"x.shape: {x.shape}, y.shape: {y.shape}")
 
     # train dataset
-    percent = 0.99
+    percent = 0.95
     train_x = x[:int(len(x) * percent)]
     train_y = y[:int(len(y) * percent)]
     val_x = x[int(len(x) * percent):]
@@ -268,7 +287,7 @@ def main(args):
         model = UNet(latent_dim, latent_dim).to(device)
         train_unet(model, train_dataloader, val_dataloader, save_dir, writer, device, args)
     elif args.model == "unet_dm":
-        model = UNet(latent_dim, latent_dim).to(device)
+        model = None
         train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, device, args)
 
 
@@ -279,12 +298,17 @@ def main(args):
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--num_epochs', type=int, default=500)
     parser.add_argument("--validation_every", type=int, default=100)
+    parser.add_argument("--save_every_epochs", type=int, default=2)
     parser.add_argument("--run_name", type=str, default="default")
     parser.add_argument("--upscaling", action="store_true", default=False)
     parser.add_argument("--chi2-reg", type=float, default=0.0)
     parser.add_argument("--model", type=str, default="unet", choices=["unet", "unet_dm"])
     parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--pretrained", type=str, default=None)
+    parser.add_argument("--restore_config", type=str, default=None)
+    parser.add_argument("--lr", type=float, default=1e-4)
 
     args = parser.parse_args()
     main(args)
