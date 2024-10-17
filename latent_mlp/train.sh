@@ -1,4 +1,5 @@
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-python train.py --batch_size 128 --run_name unet_upscaling_reg_full --upscaling --chi2-reg 0.01 --save_every_epochs 5 --num_epochs 500
+# python train.py --batch_size 8 --run_name unet_dm_cond --model unet_dm_cond --logger tensorboard --debug
+accelerate launch  --main_process_port 29500 train.py --batch_size 8 --run_name unet_dm_cond --model unet_dm_cond --logger wandb

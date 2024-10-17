@@ -7,6 +7,7 @@ _import_structure = {"pipeline_ddim": ["DDIMPipeline"]}
 
 if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
     from .pipeline_ddim import DDIMPipeline
+    from .pipeline_ddim_condition import DDIMCondPipeline
 else:
     import sys
 

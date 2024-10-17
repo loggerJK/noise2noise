@@ -7,6 +7,8 @@ import os
 from tqdm import tqdm
 from argparse import ArgumentParser
 from utils import my_collate_fn, CustomDataset
+from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+
 
 def chi2_neg_log_prob(x:torch.Tensor):
     x = x.reshape(x.shape[0], -1) # (N, C, H, W) -> (N, C*H*W)
@@ -81,28 +83,52 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
     from diffusers.optimization import get_cosine_schedule_with_warmup
 
     from diffusers import DDPMPipeline, DDIMPipeline
+    from diffusers.pipelines.ddim.pipeline_ddim_condition import DDIMCondPipeline
     from diffusers.utils import make_image_grid
     import os
 
-    from model import create_unet_dm
+    from model import create_unet_dm, create_unet_dm_cond
 
     import torch.nn.functional as F
 
-    if args.pretrained is not None:
+    if args.pretrained is None:
         # Initialize
-        model, config = create_unet_dm(args) # Now, config contains args
+        if args.model == "unet_dm":
+            model, config = create_unet_dm(args) # Now, config contains args
+        elif args.model == "unet_dm_cond":
+            model, config = create_unet_dm_cond(args)
+        else:
+            raise ValueError(f"Invalid model type: {args.model}")
+        
 
         print(f"Model config: {config}")
+
+        # Save config
+        config_json = config.to_json()
+        import json
+        with open(os.path.join(save_dir, 'config.json'), 'w') as f:
+            json.dump(config_json, f)
+        with open(os.path.join(save_dir, 'args.json'), 'w') as f:
+            json.dump(vars(args), f)
 
         noise_scheduler = DDIMScheduler(num_train_timesteps=1000,
                                         clip_sample=False,
                                         )
+        tokenizer = CLIPTokenizer.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="text_encoder")
+
     else :
         # Restore from pretrained
-        pipe = DDIMPipeline.from_pretrained(args.pretrained)
+        if args.model == "unet_dm":
+            pipe = DDIMPipeline.from_pretrained(args.pretrained)
+        elif args.model == "unet_dm_cond":
+            pipe = DDIMCondPipeline.from_pretrained(args.pretrained)
+            tokenizer = pipe.tokenizer
+            text_encoder = pipe.text_encoder
+
         model = pipe.unet
         noise_scheduler = pipe.scheduler
-        if args.restore_config : config = pipe.config
+        # if args.restore_config : config = pipe.config
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -112,15 +138,23 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
     )
 
     # Initialize accelerator and tensorboard logging
+    logger = args.logger
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
-        log_with="tensorboard",
+        log_with=logger,
         project_dir=config.output_dir,
     )
-    accelerator.init_trackers(
-                project_name="./",
-            )
+    if logger == "tensorboard":
+        accelerator.init_trackers(
+                    project_name="./",
+                )
+    elif logger == "wandb":
+        accelerator.init_trackers(
+            project_name="noise2noise",
+            config=config,
+            init_kwargs={"name": args.run_name},
+        )
 
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the
@@ -128,6 +162,9 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
     model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
+    if args.model == "unet_dm_cond":
+        tokenizer, text_encoder = accelerator.prepare(tokenizer, text_encoder)
+    device = accelerator.device
 
     global_step = 0
 
@@ -136,7 +173,7 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
 
-        for step, (x, y) in enumerate(train_dataloader):
+        for step, (x, y, prompts) in enumerate(train_dataloader):
             if config.upscaling:
                 y = y *  (torch.norm(x, dim=[1,2,3], p=2) / torch.norm(y, dim=[1,2,3], p=2)).reshape(-1, 1, 1, 1)
 
@@ -155,13 +192,37 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
             # (this is the forward diffusion process)
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
+            # Process the prompt
+            text_input = tokenizer(
+                prompts, padding="max_length", max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt"
+            )
+            with torch.no_grad():
+                text_embeddings = text_encoder(text_input.input_ids.to(y.device))[0]
+
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
-                loss = F.mse_loss(noise_pred, noise)
-                if config.chi2_reg > 0:
-                    reg = chi2_neg_log_prob(noise_pred)
-                    loss += config.chi2_reg * reg
+                if args.model == "unet_dm":
+                    noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+                elif args.model == "unet_dm_cond":
+                    noise_pred = model(noisy_images, timesteps, text_embeddings, return_dict=False)[0]
+                mse_loss = F.mse_loss(noise_pred, noise)
+
+                # Regularization
+                reg_loss = torch.tensor(0.0).to(noise_pred.device)
+                if args.chi2_reg > 0:
+                    pred_original_sample = []
+                    for noise_pred_, t, noisy_image in zip(noise_pred, timesteps, noisy_images):
+                        if t < 100:
+                            pred_original_sample_ = noise_scheduler.step(noise_pred_, t, noisy_image).pred_original_sample
+                            pred_original_sample.append(pred_original_sample_)
+                    if len(pred_original_sample ) > 0:
+                        pred_original_sample = torch.stack(pred_original_sample)
+                        reg = chi2_neg_log_prob(pred_original_sample)
+                    else:
+                        reg = torch.tensor(0.0).to(noise_pred.device)
+                    reg_loss = args.chi2_reg * reg
+                loss = mse_loss + reg_loss
+
 
                 accelerator.backward(loss)
 
@@ -174,17 +235,22 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
 
             progress_bar.update(1)
             # logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step,}
-            logs = {"Loss/train": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            logs = {"Loss/train": loss.detach().item(), "Loss/train/mse" : mse_loss.detach().item(),  "lr": lr_scheduler.get_last_lr()[0], "step": global_step, "epoch": epoch}
             if args.chi2_reg > 0:
-                logs["Loss/chi2_reg"] = reg.detach().item()
+                logs["Loss/chi2_reg"] = reg_loss.detach().item()
+                logs["chi2"] = reg.detach().item()
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
             global_step += 1
 
         # Validation loop
         # After each epoch you optionally sample some demo images with evaluate() and save the model
-        if (epoch % config.save_image_epochs == 0):
+        if args.model == "unet_dm":
             pipeline = DDIMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
+        elif args.model == "unet_dm_cond":
+            pipeline = DDIMCondPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler, tokenizer=accelerator.unwrap_model(tokenizer), text_encoder=accelerator.unwrap_model(text_encoder))
+
+        if (epoch % config.val_every_epochs == 0):
             pipeline.set_progress_bar_config(disable=True) # Disable the progress bar for this call
 
             with torch.no_grad():
@@ -192,28 +258,38 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                 val_progress_bar = tqdm(total=len(val_dataloader), disable=not accelerator.is_local_main_process)
                 val_progress_bar.set_description(f"Val Epoch {epoch}")
                 val_loss = 0.0
-                for val_x, val_y in (val_dataloader):
-                    pred = pipeline(
-                        batch_size=config.eval_batch_size,
-                        latents = val_x,
-                    ).images
+                total_len = 0
+                for val_x, val_y, prompts in (val_dataloader):
+                    if args.model == "unet_dm":
+                        pred = pipeline(
+                            batch_size=config.eval_batch_size,
+                            latents = val_x,
+                            num_inference_steps=config.num_inference_steps,
+                        ).images
+                    elif args.model == "unet_dm_cond":
+                        pred = pipeline(
+                            batch_size=config.eval_batch_size,
+                            latents = val_x,
+                            prompt = prompts,
+                            num_inference_steps=config.num_inference_steps,
+                        ).images
 
                     all_preds = accelerator.gather(pred)
                     all_val_y = accelerator.gather(val_y)
-                    loss = F.mse_loss(all_preds, all_val_y)
-                    if config.chi2_reg > 0:
-                        reg = chi2_neg_log_prob(pred)
-                        loss += config.chi2_reg * reg
+                    loss = F.mse_loss(all_preds, all_val_y, reduction="sum")
+                    # if config.chi2_reg > 0:
+                    #     reg = chi2_neg_log_prob(pred)
+                    #     loss += config.chi2_reg * reg
                     val_loss += loss.item()
+                    total_len += len(all_preds)
                     val_progress_bar.update(1)
-                val_loss /= len(val_dataloader)
+                val_loss /= total_len
                 logs = {"Loss/val": val_loss}
-                if args.chi2_reg > 0:
-                    logs["Loss/chi2_reg"] = reg.detach().item()
+                # if args.chi2_reg > 0:
+                #     logs["Loss/chi2_reg"] = reg.detach().item()
                 accelerator.log(logs, step=epoch) # Log the validation loss every epoch
 
         if accelerator.is_main_process :
-            pipeline = DDIMPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler)
             pipeline.save_pretrained(config.output_dir)
             if (epoch % config.save_model_epochs == 0):
                 pipeline.save_pretrained(os.path.join(config.output_dir, f"model_{epoch}epoch"))
@@ -240,75 +316,98 @@ def main(args):
     ##### Load Dataset
     import glob
     from pprint import pprint
-    folder_path = '/media/data1/noise2noise_dataset/sdxl/'
-    # 0_initial_latent.pt
-    initial_latents = sorted(glob.glob(folder_path + '*_initial_latent.pt'), key=lambda x: int(x.split('/')[-1].split('_')[0]))
-    # 0_latent.pt
-    inversion_latents = sorted(glob.glob(folder_path + '*[0-9]_inversion_latent.pt'), key=lambda x: int(x.split('/')[-1].split('_')[0]))
-    # 0_recon.png
+    folder_path = '/media/data1/noise2noise_dataset/coco_latents'
+    initial_folder_path = os.path.join(folder_path, 'initial')
+    inversion_folder_path = os.path.join(folder_path, 'inversion')
+
+    initial_latents = sorted(glob.glob(os.path.join(initial_folder_path , '*.npy')), key=lambda x: int(x.split('/')[-1].split('.')[0]))
+    inversion_latents = sorted(glob.glob(os.path.join(inversion_folder_path , '*.npy')), key=lambda x: int(x.split('/')[-1].split('.')[0]))
+    prompts = sorted(glob.glob(os.path.join(initial_folder_path , '*_prompt.txt')), key=lambda x: int(x.split('/')[-1].split('_')[0]))
 
     if args.debug:
         initial_latents = initial_latents[:100]
         inversion_latents = inversion_latents[:100]
+        prompts = prompts[:100]
 
-    # File loading
-    initial_latents_loaded = []
-    inversion_latents_loaded = []
+    ####### File loading #######
+    if not args.lazy_load:
+        initial_latents_loaded = []
+        inversion_latents_loaded = []
 
-    ## inversion latents 중에서, 대응하는 inital latent가 있는지 확인하고, 있는 경우에만 로드한다
-    for i, latent in tqdm(enumerate(inversion_latents), total=len(inversion_latents)):
-        initial_latent = latent.replace('_inversion_latent.pt', '_initial_latent.pt')
-        if initial_latent in initial_latents:
-            initial_latents_loaded.append(torch.load(initial_latent).cpu().numpy())
-            inversion_latents_loaded.append(torch.load(latent).cpu().numpy())
+        ## inversion latents 중에서, 대응하는 inital latent가 있는지 확인하고, 있는 경우에만 로드한다
+        # for i, latent in tqdm(enumerate(inversion_latents), total=len(inversion_latents)):
+        #     initial_latent = latent.replace('_inversion_latent.pt', '_initial_latent.pt')
+        #     if initial_latent in initial_latents:
+        #         initial_latents_loaded.append(torch.load(initial_latent).cpu().numpy())
+        #         inversion_latents_loaded.append(torch.load(latent).cpu().numpy())
 
-    initial_latents = torch.Tensor(np.array(initial_latents_loaded)).squeeze(1) # (N, C, H, W)
-    inversion_latents = torch.Tensor(np.array(inversion_latents_loaded)).squeeze(1) # (N, C, H, W)
+        for i, (initial_latent, inversion_latent) in tqdm(enumerate(zip(initial_latents, inversion_latents)), total=len(inversion_latents)):
+            initial_latents_loaded.append(np.load(initial_latent))
+            inversion_latents_loaded.append(np.load(inversion_latent))
+
+        
+        for i, prompt in tqdm(enumerate(prompts), total=len(prompts)):
+            with open(prompt, 'r') as f:
+                prompts[i] = f.read()
+
+        initial_latents = torch.Tensor(np.array(initial_latents_loaded)).squeeze(1) # (N, C, H, W)
+        inversion_latents = torch.Tensor(np.array(inversion_latents_loaded)).squeeze(1) # (N, C, H, W)
+        prompts = prompts
 
     x = initial_latents
     y = inversion_latents
+    # print(f"x.shape: {x.shape}, y.shape: {y.shape}")
+    # latent_dim = x.shape[1]
 
-    latent_dim = x.shape[1]
-    print(f"x.shape: {x.shape}, y.shape: {y.shape}")
+    latent_dim = 128
 
     # train dataset
     percent = 0.95
     train_x = x[:int(len(x) * percent)]
     train_y = y[:int(len(y) * percent)]
+    train_prompt = prompts[:int(len(prompts) * percent)]
     val_x = x[int(len(x) * percent):]
     val_y = y[int(len(y) * percent):]
-    train_dataset = torch.utils.data.TensorDataset(train_x, train_y)
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_dataset = torch.utils.data.TensorDataset(val_x, val_y)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    val_prompt = prompts[int(len(prompts) * percent):]
+    train_dataset = CustomDataset(train_x, train_y, train_prompt)
+    val_dataset = CustomDataset(val_x, val_y, val_prompt)
+    if args.lazy_load:
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=my_collate_fn, num_workers=4)
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=my_collate_fn, num_workers=4)
+    else:
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,num_workers=4)
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # Load Model
     if args.model == "unet":
         model = UNet(latent_dim, latent_dim).to(device)
         train_unet(model, train_dataloader, val_dataloader, save_dir, writer, device, args)
-    elif args.model == "unet_dm":
+    elif args.model == "unet_dm" or args.model == "unet_dm_cond":
         model = None
         train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, device, args)
 
 
 
-
-
-
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_epochs', type=int, default=500)
-    parser.add_argument("--validation_every", type=int, default=100)
-    parser.add_argument("--save_every_epochs", type=int, default=2)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--num_epochs', type=int, default=400)
+    parser.add_argument("--val_every_epochs", type=int, default=5)
+    parser.add_argument("--save_every_epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-4)
+
     parser.add_argument("--run_name", type=str, default="default")
     parser.add_argument("--upscaling", action="store_true", default=False)
     parser.add_argument("--chi2-reg", type=float, default=0.0)
-    parser.add_argument("--model", type=str, default="unet", choices=["unet", "unet_dm"])
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--pretrained", type=str, default=None)
     parser.add_argument("--restore_config", type=str, default=None)
-    parser.add_argument("--lr", type=float, default=1e-4)
+
+    parser.add_argument("--model", type=str, default="unet", choices=["unet", "unet_dm", "unet_dm_cond"])
+    parser.add_argument("--num_inference_steps", type=int, default=20)
+    parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"])
+
+    parser.add_argument("--lazy_load", action="store_true", default=True, help="if True, does not load the entire dataset into memory. Useful for large datasets.")
 
     args = parser.parse_args()
     main(args)
