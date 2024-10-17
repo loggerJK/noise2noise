@@ -2,3 +2,4 @@ results/
 sample/
 *.ipynb
 wandb/
+__pycache__/
