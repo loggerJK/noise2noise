@@ -1,6 +1,7 @@
 import torch.nn as nn
 
 from unet_parts import DoubleConv, Down, Up, OutConv
+from dataclasses import dataclass, asdict, field
 
 class residualMLP(nn.Module):
     def __init__(self, latent_dim, hidden_dim):
@@ -77,6 +78,9 @@ class TrainingConfig():
     hub_private_repo = False
     overwrite_output_dir = True  # overwrite the old model when re-running the notebook
     seed = 0
+
+    def asdict(self):
+        return asdict(self)
 
 
 def create_unet_dm(args):

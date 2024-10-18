@@ -8,6 +8,7 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 from utils import my_collate_fn, CustomDataset
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+from dataclasses import dataclass, asdict, field
 
 
 def chi2_neg_log_prob(x:torch.Tensor):
@@ -27,7 +28,7 @@ def train_unet(model, train_dataloader, val_dataloader, save_dir, writer, device
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     model.train()
-    for epoch in tqdm(range(args.num_epochs)):
+    for epoch in tqdm(range(args.start_from_epoch, args.num_epochs)):
         for i, (x, y) in enumerate(train_dataloader):
             step = i + epoch * len(train_dataloader)
             optimizer.zero_grad()
@@ -99,29 +100,21 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
             model, config = create_unet_dm_cond(args)
         else:
             raise ValueError(f"Invalid model type: {args.model}")
-        
-
-        print(f"Model config: {config}")
-
-        # Save config
-        config_json = config.to_json()
-        import json
-        with open(os.path.join(save_dir, 'config.json'), 'w') as f:
-            json.dump(config_json, f)
-        with open(os.path.join(save_dir, 'args.json'), 'w') as f:
-            json.dump(vars(args), f)
 
         noise_scheduler = DDIMScheduler(num_train_timesteps=1000,
                                         clip_sample=False,
                                         )
-        tokenizer = CLIPTokenizer.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="tokenizer")
-        text_encoder = CLIPTextModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="text_encoder")
+        tokenizer = CLIPTokenizer.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="tokenizer", variant="fp16")
+        text_encoder = CLIPTextModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="text_encoder", variant="fp16")
 
     else :
         # Restore from pretrained
+
         if args.model == "unet_dm":
+            _, config = create_unet_dm(args) # Now, config contains args
             pipe = DDIMPipeline.from_pretrained(args.pretrained)
         elif args.model == "unet_dm_cond":
+            _, config = create_unet_dm_cond(args)
             pipe = DDIMCondPipeline.from_pretrained(args.pretrained)
             tokenizer = pipe.tokenizer
             text_encoder = pipe.text_encoder
@@ -129,6 +122,16 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
         model = pipe.unet
         noise_scheduler = pipe.scheduler
         # if args.restore_config : config = pipe.config
+
+    print(f"Model config: {config}")
+
+    # Save config
+    config_dict = config.asdict()
+    import json
+    with open(os.path.join(save_dir, 'config.json'), 'w') as f:
+        json.dump(config_dict, f)
+    with open(os.path.join(save_dir, 'args.json'), 'w') as f:
+        json.dump(vars(args), f)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -169,7 +172,7 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
     global_step = 0
 
     # Now you train the model
-    for epoch in range(config.num_epochs):
+    for epoch in range(config.start_from_epoch, config.num_epochs):
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
 
@@ -276,18 +279,18 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
 
                     all_preds = accelerator.gather(pred)
                     all_val_y = accelerator.gather(val_y)
-                    loss = F.mse_loss(all_preds, all_val_y, reduction="sum")
+                    loss = F.mse_loss(all_preds, all_val_y)
                     # if config.chi2_reg > 0:
                     #     reg = chi2_neg_log_prob(pred)
                     #     loss += config.chi2_reg * reg
-                    val_loss += loss.item()
-                    total_len += len(all_preds)
+                    val_loss += loss.detach().item()
                     val_progress_bar.update(1)
-                val_loss /= total_len
+                    val_progress_bar.set_postfix({"val_loss": loss})
+                val_loss /= len(val_dataloader)
                 logs = {"Loss/val": val_loss}
                 # if args.chi2_reg > 0:
                 #     logs["Loss/chi2_reg"] = reg.detach().item()
-                accelerator.log(logs, step=epoch) # Log the validation loss every epoch
+                accelerator.log(logs, step=global_step) # Log the validation loss every epoch
 
         if accelerator.is_main_process :
             pipeline.save_pretrained(config.output_dir)
@@ -392,7 +395,7 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--num_epochs', type=int, default=400)
-    parser.add_argument("--val_every_epochs", type=int, default=5)
+    parser.add_argument("--val_every_epochs", type=int, default=2)
     parser.add_argument("--save_every_epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
 
@@ -400,7 +403,6 @@ if __name__ == '__main__':
     parser.add_argument("--upscaling", action="store_true", default=False)
     parser.add_argument("--chi2-reg", type=float, default=0.0)
     parser.add_argument("--debug", action="store_true", default=False)
-    parser.add_argument("--pretrained", type=str, default=None)
     parser.add_argument("--restore_config", type=str, default=None)
 
     parser.add_argument("--model", type=str, default="unet", choices=["unet", "unet_dm", "unet_dm_cond"])
@@ -408,6 +410,9 @@ if __name__ == '__main__':
     parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"])
 
     parser.add_argument("--lazy_load", action="store_true", default=True, help="if True, does not load the entire dataset into memory. Useful for large datasets.")
+
+    parser.add_argument("--pretrained", type=str, default=None)
+    parser.add_argument("--start_from_epoch", type=int, default=0)
 
     args = parser.parse_args()
     main(args)
