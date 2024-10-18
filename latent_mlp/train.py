@@ -9,6 +9,7 @@ from argparse import ArgumentParser
 from utils import my_collate_fn, CustomDataset
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
 from dataclasses import dataclass, asdict, field
+from torch.utils.data import Subset
 
 
 def chi2_neg_log_prob(x:torch.Tensor):
@@ -21,7 +22,7 @@ def chi2_neg_log_prob(x:torch.Tensor):
     reg = const + reg
     # print(f"norm.shape : {norm.shape}, neg-reg.shape: {reg.shape}")
     # print(f"norm : {norm.mean()}, neg-reg: {- reg.mean()}")
-    return  -(reg.mean())
+    return  -(reg.mean()), norm.mean()
 
 def train_unet(model, train_dataloader, val_dataloader, save_dir, writer, device, args):
     # train dataset
@@ -262,7 +263,10 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                 val_progress_bar.set_description(f"Val Epoch {epoch}")
                 val_loss = 0.0
                 total_len = 0
+                mean_norm = 0.0
+                mean_chi2 = 0.0
                 for val_x, val_y, prompts in (val_dataloader):
+                    val_x = torch.randn(val_x.shape, device=val_x.device)
                     if args.model == "unet_dm":
                         pred = pipeline(
                             batch_size=config.eval_batch_size,
@@ -283,11 +287,20 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                     # if config.chi2_reg > 0:
                     #     reg = chi2_neg_log_prob(pred)
                     #     loss += config.chi2_reg * reg
+                    reg, norm = chi2_neg_log_prob(all_preds)
+                    
                     val_loss += loss.detach().item()
+                    mean_norm += norm.detach().item()
+                    mean_chi2 += reg.detach().item()
+
                     val_progress_bar.update(1)
-                    val_progress_bar.set_postfix({"val_loss": loss})
+                    val_progress_bar.set_postfix({"val_loss": loss, "val_norm": norm.detach().item(), "chi2" : reg.detach().item()})
+                
                 val_loss /= len(val_dataloader)
-                logs = {"Loss/val": val_loss}
+                mean_norm /= len(val_dataloader)
+                mean_chi2 /= len(val_dataloader)
+
+                logs = {"Loss/val": val_loss, "val_norm": mean_norm, "val_chi2": mean_chi2}
                 # if args.chi2_reg > 0:
                 #     logs["Loss/chi2_reg"] = reg.detach().item()
                 accelerator.log(logs, step=global_step) # Log the validation loss every epoch
@@ -365,15 +378,29 @@ def main(args):
     latent_dim = 128
 
     # train dataset
-    percent = 0.95
-    train_x = x[:int(len(x) * percent)]
-    train_y = y[:int(len(y) * percent)]
-    train_prompt = prompts[:int(len(prompts) * percent)]
-    val_x = x[int(len(x) * percent):]
-    val_y = y[int(len(y) * percent):]
-    val_prompt = prompts[int(len(prompts) * percent):]
+    percent = 0.99
+    def choice(N, percent):
+        import random
+        tmp = list(range(N))
+        random.shuffle(tmp)
+        cut = int(N * percent)
+        return tmp[:cut], tmp[cut:]
+    train_idx, val_idx = choice(len(x), percent)
+
+    train_x = x #[:int(len(x) * percent)]
+    train_y = y #[:int(len(y) * percent)]
+    train_prompt = prompts #[:int(len(prompts) * percent)]
+
+    val_x = x
+    val_y = y
+    val_prompt = prompts
+
     train_dataset = CustomDataset(train_x, train_y, train_prompt)
     val_dataset = CustomDataset(val_x, val_y, val_prompt)
+
+    train_dataset = Subset(train_dataset, train_idx)
+    val_dataset = Subset(val_dataset, val_idx)
+
     if args.lazy_load:
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=my_collate_fn, num_workers=4)
         val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=my_collate_fn, num_workers=4)
