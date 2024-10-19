@@ -4,7 +4,7 @@ import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from model import residualMLP, UNet
 import os
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from argparse import ArgumentParser
 from utils import my_collate_fn, CustomDataset
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
@@ -140,6 +140,9 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
         num_warmup_steps=config.lr_warmup_steps,
         num_training_steps=(len(train_dataloader) * config.num_epochs),
     )
+    
+    # Requires grad off for text encoder
+    text_encoder.requires_grad_(False)
 
     # Initialize accelerator and tensorboard logging
     logger = args.logger
@@ -197,10 +200,10 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             # Process the prompt
-            text_input = tokenizer(
-                prompts, padding="max_length", max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt"
-            )
             with torch.no_grad():
+                text_input = tokenizer(
+                    prompts, padding="max_length", max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt"
+                )
                 text_embeddings = text_encoder(text_input.input_ids.to(y.device))[0]
 
             with accelerator.accumulate(model):
@@ -257,6 +260,7 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
         if (epoch % config.val_every_epochs == 0):
             pipeline.set_progress_bar_config(disable=True) # Disable the progress bar for this call
 
+            # Validation loop
             with torch.no_grad():
                 print(f"Generating images for epoch {epoch}, length : {len(val_dataloader)}")
                 val_progress_bar = tqdm(total=len(val_dataloader), disable=not accelerator.is_local_main_process)
@@ -265,6 +269,9 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                 total_len = 0
                 mean_norm = 0.0
                 mean_chi2 = 0.0
+
+                custom_mean_norm = 0.0
+                custom_mean_chi2 = 0.0
                 for val_x, val_y, prompts in (val_dataloader):
                     val_x = torch.randn(val_x.shape, device=val_x.device)
                     if args.model == "unet_dm":
@@ -280,6 +287,13 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                             prompt = prompts,
                             num_inference_steps=config.num_inference_steps,
                         ).images
+                        prompt_ = "A photo of a corgi riding a skateboard"
+                        pred_ = pipeline(
+                            batch_size=config.eval_batch_size,
+                            latents = torch.randn(val_x.shape, device=val_x.device),
+                            prompt = [prompt_] * val_x.shape[0],
+                            num_inference_steps=config.num_inference_steps,
+                        ).images
 
                     all_preds = accelerator.gather(pred)
                     all_val_y = accelerator.gather(val_y)
@@ -293,14 +307,27 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                     mean_norm += norm.detach().item()
                     mean_chi2 += reg.detach().item()
 
+                    # Custom prompt
+                    all_preds_ = accelerator.gather(pred_)
+                    custom_reg, custom_norm = chi2_neg_log_prob(all_preds_)
+                    custom_mean_norm += custom_norm.detach().item()
+                    custom_mean_chi2 += custom_reg.detach().item()
+
                     val_progress_bar.update(1)
-                    val_progress_bar.set_postfix({"val_loss": loss, "val_norm": norm.detach().item(), "chi2" : reg.detach().item()})
+                    val_progress_bar.set_postfix({
+                        "val_loss": loss.detach().item(), 
+                        "val_norm": norm.detach().item(), 
+                        "chi2" : reg.detach().item(),
+                        "val_custom_norm": custom_norm.detach().item(),
+                        "val_custom_chi2" : custom_reg.detach().item(),})
                 
                 val_loss /= len(val_dataloader)
                 mean_norm /= len(val_dataloader)
                 mean_chi2 /= len(val_dataloader)
+                custom_mean_norm /= len(val_dataloader)
+                custom_mean_chi2 /= len(val_dataloader)
 
-                logs = {"Loss/val": val_loss, "val_norm": mean_norm, "val_chi2": mean_chi2}
+                logs = {"Loss/val": val_loss, "val_norm": mean_norm, "val_chi2": mean_chi2, "val_custom_norm": custom_mean_norm, "val_custom_chi2": custom_mean_chi2}
                 # if args.chi2_reg > 0:
                 #     logs["Loss/chi2_reg"] = reg.detach().item()
                 accelerator.log(logs, step=global_step) # Log the validation loss every epoch

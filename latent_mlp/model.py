@@ -139,16 +139,16 @@ def create_unet_dm_cond(args):
         layers_per_block=2,  # how many ResNet layers to use per UNet block
         block_out_channels=(128, 256, 512, 512),  # the number of output channels for each UNet block
         down_block_types=(
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
+            "DownBlock2D",
+            "DownBlock2D",
             "CrossAttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
             "DownBlock2D",
         ),
         up_block_types=(
             "UpBlock2D",  # a regular ResNet upsampling block
             "CrossAttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-            "CrossAttnUpBlock2D",
-            "CrossAttnUpBlock2D",
+            "UpBlock2D",
+            "UpBlock2D",
         ),
         cross_attention_dim=768, # CLIPTextModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="text_encoder")
     )
