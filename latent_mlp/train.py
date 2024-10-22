@@ -99,14 +99,14 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
             model, config = create_unet_dm(args) # Now, config contains args
         elif args.model == "unet_dm_cond":
             model, config = create_unet_dm_cond(args)
+            tokenizer = CLIPTokenizer.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="tokenizer", variant="fp16")
+            text_encoder = CLIPTextModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="text_encoder", variant="fp16")
         else:
             raise ValueError(f"Invalid model type: {args.model}")
 
         noise_scheduler = DDIMScheduler(num_train_timesteps=1000,
                                         clip_sample=False,
                                         )
-        tokenizer = CLIPTokenizer.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="tokenizer", variant="fp16")
-        text_encoder = CLIPTextModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="text_encoder", variant="fp16")
 
     else :
         # Restore from pretrained
@@ -142,7 +142,7 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
     )
     
     # Requires grad off for text encoder
-    text_encoder.requires_grad_(False)
+    if args.model == 'unet_dm_cond' : text_encoder.requires_grad_(False)
 
     # Initialize accelerator and tensorboard logging
     logger = args.logger
@@ -200,11 +200,12 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             # Process the prompt
-            with torch.no_grad():
-                text_input = tokenizer(
-                    prompts, padding="max_length", max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt"
-                )
-                text_embeddings = text_encoder(text_input.input_ids.to(y.device))[0]
+            if args.model == "unet_dm_cond":
+                with torch.no_grad():
+                    text_input = tokenizer(
+                        prompts, padding="max_length", max_length = tokenizer.model_max_length, truncation=True, return_tensors="pt"
+                    )
+                    text_embeddings = text_encoder(text_input.input_ids.to(y.device))[0]
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
@@ -308,18 +309,22 @@ def train_unet_dm(model, train_dataloader, val_dataloader, save_dir, writer, dev
                     mean_chi2 += reg.detach().item()
 
                     # Custom prompt
-                    all_preds_ = accelerator.gather(pred_)
-                    custom_reg, custom_norm = chi2_neg_log_prob(all_preds_)
-                    custom_mean_norm += custom_norm.detach().item()
-                    custom_mean_chi2 += custom_reg.detach().item()
+                    if args.model == "unet_dm_cond":
+                        all_preds_ = accelerator.gather(pred_)
+                        custom_reg, custom_norm = chi2_neg_log_prob(all_preds_)
+                        custom_mean_norm += custom_norm.detach().item()
+                        custom_mean_chi2 += custom_reg.detach().item()
 
                     val_progress_bar.update(1)
-                    val_progress_bar.set_postfix({
+                    postfix = {
                         "val_loss": loss.detach().item(), 
                         "val_norm": norm.detach().item(), 
-                        "chi2" : reg.detach().item(),
+                        "chi2" : reg.detach().item()}
+                    if args.model == "unet_dm_cond":
+                        postfix.update({
                         "val_custom_norm": custom_norm.detach().item(),
-                        "val_custom_chi2" : custom_reg.detach().item(),})
+                        "val_custom_chi2" : custom_reg.detach().item()})
+                    val_progress_bar.set_postfix(postfix)
                 
                 val_loss /= len(val_dataloader)
                 mean_norm /= len(val_dataloader)
@@ -359,7 +364,7 @@ def main(args):
     ##### Load Dataset
     import glob
     from pprint import pprint
-    folder_path = '/media/data1/noise2noise_dataset/coco_latents'
+    folder_path = '/media/dataset1/project/jiwon/noise2noise_dataset/coco_latents/'
     initial_folder_path = os.path.join(folder_path, 'initial')
     inversion_folder_path = os.path.join(folder_path, 'inversion')
 
