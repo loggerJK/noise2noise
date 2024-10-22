@@ -142,10 +142,10 @@ def create_unet_dm_cond(args):
             "DownBlock2D",
             "DownBlock2D",
             "CrossAttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-            "DownBlock2D",
+            "CrossAttnDownBlock2D",
         ),
         up_block_types=(
-            "UpBlock2D",  # a regular ResNet upsampling block
+            "CrossAttnUpBlock2D",  # a regular ResNet upsampling block
             "CrossAttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
             "UpBlock2D",
             "UpBlock2D",

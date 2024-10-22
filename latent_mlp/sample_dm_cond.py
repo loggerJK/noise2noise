@@ -14,16 +14,16 @@ def main(args):
     # /media/dataset1/project/jiwon/noise2noise/latent_mlp/results/unet_dm/unet/diffusion_pytorch_model.safetensors
     exp_name = args.model_path.split('/')[-1]
     # model_name = args.model_path.split('/')[-1].split('.')[0]
-    save_dir = os.path.join('./sample/', exp_name)
+    save_dir = os.path.join('./sample/unet_dm_cond4', exp_name)
     os.makedirs(save_dir, exist_ok=True)
     print(f"Saving to {save_dir}")
 
 
     # Scheduler
-    noise_scheduler = DDIMScheduler(num_train_timesteps=1000)
     pipe = DDIMCondPipeline.from_pretrained(args.model_path)
     prompt = "A corgi riding a skateboard"
-    # pipe = pipe.to('cuda')
+    # prompt = "a few small loaves of bread in a basket"
+    pipe = pipe.to('cuda')
 
 
     for i in range(args.target_size):
@@ -32,7 +32,7 @@ def main(args):
             pred_noise = pipe(batch_size=noise.shape[0],
                               latents=noise,
                               prompt=prompt,
-                              num_inference_steps=20,
+                              num_inference_steps=50,
             )[0]
 
         np.save(f"{save_dir}/{i}_noise.npy", noise.cpu().numpy())
