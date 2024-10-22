@@ -3,4 +3,4 @@ sample/
 *.ipynb
 wandb/
 __pycache__/
-stylegan2-ada-pytorch/
+id_container

@@ -40,6 +40,7 @@ def chi2_neg_log_prob(x:torch.Tensor):
     return  -(reg.mean()), norm.mean()
 
 def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer, device, args):
+    torch.autograd.set_detect_anomaly(True)
     if args.pretrained is None:
         # Initialize
         if args.model == "unet_dm_gan":
@@ -203,7 +204,7 @@ def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer,
                 ).images
 
                 if mode == "disc":
-                    real_logits = disc(real, None)
+                    real_logits = disc(real.clone(), None)
                     fake_logits = disc(fake.detach(), None)
                     disc_loss = F.softplus(real_logits).mean() + F.softplus(-fake_logits).mean()
                     loss = disc_loss
