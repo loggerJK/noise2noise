@@ -21,14 +21,15 @@ def main(args):
     # Scheduler
     noise_scheduler = DDIMScheduler(num_train_timesteps=1000)
     pipe = DDIMPipeline.from_pretrained(args.model_path)
-    # pipe = pipe.to('cuda')
+    pipe = pipe.to('cuda')
 
 
     for i in range(args.target_size):
         noise = torch.randn(1, 4, 128, 128).to(pipe.device)
         with torch.no_grad():
             pred_noise = pipe(batch_size=noise.shape[0],
-                              latents=noise
+                              latents=noise,
+                              num_inference_steps=50,
             )[0]
 
         np.save(f"{save_dir}/{i}_noise.npy", noise.cpu().numpy())

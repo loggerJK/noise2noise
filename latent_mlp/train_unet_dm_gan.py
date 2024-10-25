@@ -20,6 +20,7 @@ from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPV
 from dataclasses import dataclass, asdict, field
 from torch.utils.data import Subset
 import torch.nn.functional as F
+import bitsandbytes as bnb
 
 import os, sys
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname("__file__"))))
@@ -40,7 +41,6 @@ def chi2_neg_log_prob(x:torch.Tensor):
     return  -(reg.mean()), norm.mean()
 
 def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer, device, args):
-    torch.autograd.set_detect_anomaly(True)
     if args.pretrained is None:
         # Initialize
         if args.model == "unet_dm_gan":
@@ -86,7 +86,8 @@ def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer,
                      img_resolution=128,
                      img_channels=4,)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer = bnb.optim.Adam8bit(model.parameters(), lr=config.learning_rate)
     optimizer.add_param_group({"params": disc.parameters(), "lr": config.learning_rate})
     
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -129,7 +130,11 @@ def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer,
     device = accelerator.device
 
     global_step = 0
-
+    mode = "gen"
+    mode_step = 0
+    # 학습 비율 설정
+    disc_step = 100 
+    gen_step = 2000
     # Now you train the model
     for epoch in range(config.start_from_epoch, config.num_epochs):
         # Initialize the pipeline for each epoch - GAN EMA
@@ -141,12 +146,9 @@ def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer,
             
         progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
-
-        mode = "gen"
+        
         for step, (x, y, prompts) in enumerate(train_dataloader):
-            
-            # 100 Step 단위로 모드를 바꿈
-            if step % 100 == 0:
+            if 0 <= mode_step < disc_step:
                 if mode == "gen":
                     mode = "disc"
                     print("Switching to disc mode")
@@ -158,11 +160,13 @@ def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer,
                     elif args.model == "unet_dm_cond_gan":
                         pipeline = DDIMCondPipeline(unet=accelerator.unwrap_model(model), scheduler=noise_scheduler, tokenizer=accelerator.unwrap_model(tokenizer), text_encoder=accelerator.unwrap_model(text_encoder))
                     pipeline.set_progress_bar_config(disable=True)
-                else:
+            else:
+                if mode == "disc":
                     mode = "gen"
                     print("Switching to gen mode")
                     model.requires_grad_(True)
                     disc.requires_grad_(False)
+
             
             
             if config.upscaling:
@@ -200,7 +204,7 @@ def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer,
                 fake = pipeline(
                     batch_size=latents.shape[0],
                     latents = latents,
-                    num_inference_steps=config.num_inference_steps,
+                    num_inference_steps=5,
                 ).images
 
                 if mode == "disc":
@@ -266,6 +270,9 @@ def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer,
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
             global_step += 1
+            mode_step += 1
+            if mode_step >= disc_step + gen_step:
+                mode_step = 0
 
         # Validation loop
         # After each epoch you optionally sample some demo images with evaluate() and save the model
@@ -355,5 +362,6 @@ def train_unet_dm_gan(model, train_dataloader, val_dataloader, save_dir, writer,
             pipeline.save_pretrained(config.output_dir)
             if (epoch % config.save_model_epochs == 0):
                 pipeline.save_pretrained(os.path.join(config.output_dir, f"model_{epoch}epoch"))
+                torch.save(disc.state_dict(), os.path.join(config.output_dir, f"model_{epoch}epoch", "disc.pt"))
 
 
