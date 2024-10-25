@@ -1,0 +1,1 @@
+python /media/dataset1/project/jiwon/ReNoise-Inversion/noise2noise_inversion_batch.py --batch_size 1 --name ablation/TEST_trailing --steps 20 --trailing

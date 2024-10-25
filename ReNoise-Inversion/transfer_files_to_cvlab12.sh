@@ -1,0 +1,2 @@
+find /media/dataset2/jiwon/noise2noise/ReNoise-Inversion/coco_latents_sd1.5 -type f | wc -l
+scp -r /media/dataset2/jiwon/noise2noise/ReNoise-Inversion/coco_latents_sd1.5 cvlab12@163.152.163.141:/media/dataset1/donghoon/noise2noise
