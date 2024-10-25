@@ -50,7 +50,7 @@ def main(args):
     print(f"Device: {device}")
 
     # CoCo Dataset Load
-    dataset_path = '/media/dataset2/COCO2014'
+    dataset_path = '/mnt/sda/home/cvlab03/dataset/COCO2014'
     cap = datasets.CocoCaptions(root = os.path.join(dataset_path, 'images/train2014'),
                         annFile = os.path.join(dataset_path, 'annotations/captions_train2014.json'),
                         transform=transforms.PILToTensor()) # TODO : CenterCrop, Resize to 1024x1024
@@ -108,7 +108,7 @@ def main(args):
             
             # seed = int(time.time())
             idx = (start_idx + add + i) * args.num_random_seeds + j
-            idx = not_found[idx]  
+            # idx = not_found[idx]  
             
             seed = idx
             torch.manual_seed(seed)
