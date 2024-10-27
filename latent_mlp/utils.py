@@ -25,4 +25,21 @@ def my_collate_fn(batch):
     train_x = torch.Tensor(np.array(train_x)).squeeze()
     train_y = torch.Tensor(np.array(train_y)).squeeze()
     return train_x, train_y, prompt
+
+
+class CustomDatasetV2(Dataset):
+
+    def __init__(self, train_x, train_y, prompt):
+        self.train_x = train_x
+        self.train_y = train_y
+
+    def __len__(self):
+        return len(self.train_x)
+
+    def __getitem__(self, idx):
+        train_x = np.load(self.train_x[idx])
+        train_y = np.load(self.train_y[idx])
+        train_x = torch.Tensor(train_x).squeeze()
+        train_y = torch.Tensor(train_y).squeeze()
+        return train_x, train_y
     

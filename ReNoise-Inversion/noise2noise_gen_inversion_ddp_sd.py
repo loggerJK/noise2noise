@@ -50,7 +50,7 @@ def main(args):
     print(f"Device: {device}")
 
     # CoCo Dataset Load
-    dataset_path = '/mnt/sda/home/cvlab03/dataset/COCO2014'
+    dataset_path = '/media/dataset1/COCO2014'
     cap = datasets.CocoCaptions(root = os.path.join(dataset_path, 'images/train2014'),
                         annFile = os.path.join(dataset_path, 'annotations/captions_train2014.json'),
                         transform=transforms.PILToTensor()) # TODO : CenterCrop, Resize to 1024x1024
@@ -76,7 +76,7 @@ def main(args):
     print(f"GPU {rank} processing {start_idx + add} to {start_idx + add + num_prompt_per_gpu - 1}")
 
     # Model Load
-    model_type = Model_Type.SD15
+    model_type = Model_Type.SD21
     scheduler_type = Scheduler_Type.DDIM
     pipe_inversion, pipe_inference = get_pipes(model_type, scheduler_type, device=device)
     pipe_inversion.set_progress_bar_config(disable=True)
@@ -108,7 +108,6 @@ def main(args):
             
             # seed = int(time.time())
             idx = (start_idx + add + i) * args.num_random_seeds + j
-            # idx = not_found[idx]  
             
             seed = idx
             torch.manual_seed(seed)
@@ -130,33 +129,39 @@ def main(args):
 
 
             # Generate image using prompt
-            img_latent = pipe_inference(image = initial_noise,
+            inference_result = pipe_inference(image = initial_noise,
                                     prompt = prompt,
                                     denoising_start=0.0,
                                     strength=1.0,
                                     num_inference_steps = config.num_inference_steps,
                                     guidance_scale = args.guidance_scale,
-                                    output_type = "latent"
-                                    ).images[0]
+                                    output_type = "latent",
+                                    return_dict = False,
+                                    )
+            
+            img_latent = inference_result[0]
+            all_latents = inference_result[1]
+            
             # Save latent
             np.save(os.path.join(save_dir_initial, f"{idx}_imglatent.npy"), img_latent.cpu().numpy())
+            np.save(os.path.join(save_dir_initial, f"{idx}_alllatents.npy"), all_latents)
             
             # Save image
-            img_pil = pipe_inference.vae.decode(img_latent.unsqueeze(0) / pipe_inference.vae.config.scaling_factor, return_dict=False)[0].detach().cpu()
+            img_pil = pipe_inference.vae.decode(img_latent / pipe_inference.vae.config.scaling_factor, return_dict=False)[0].detach().cpu()
             img_pil = pipe_inference.image_processor.postprocess(img_pil, output_type="pil")[0]
-            img_pil.save(os.path.join(save_dir_initial, f"{idx}_img.jpg"))
+            img_pil.save(os.path.join(save_dir_initial, f"{idx}_img.png"))
 
             # Inversion
-            img, inv_latent, noise, all_latents = invert(img_pil,
-                                        prompt,
-                                        config,
-                                        pipe_inversion=pipe_inversion,
-                                        pipe_inference=pipe_inference,
-                                        #    original_size=original_size,
-                                            # crops_coords_top_left=crops_coords_top_left,
-                                        do_reconstruction=False)
+            # img, inv_latent, noise, all_latents = invert(img_pil,
+            #                             prompt,
+            #                             config,
+            #                             pipe_inversion=pipe_inversion,
+            #                             pipe_inference=pipe_inference,
+            #                             #    original_size=original_size,
+            #                                 # crops_coords_top_left=crops_coords_top_left,
+            #                             do_reconstruction=False)
 
-            np.save(os.path.join(save_dir_inversion, f"{idx}.npy"), inv_latent.cpu().numpy())
+            # np.save(os.path.join(save_dir_inversion, f"{idx}.npy"), inv_latent.cpu().numpy())
 
 
             # Save reconstructed image

@@ -4,3 +4,6 @@ sample/
 wandb/
 __pycache__/
 id_container
+test/
+checkpoints/
+diffusers_ddim_inversion/
